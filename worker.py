@@ -2,14 +2,15 @@
 """
 MODEX Text Effect Bot — Photopea rendering worker.
 
-Runs Photopea in headless Chromium, opens the PSD template, replaces the
-intended editable text layer, and exports PNG bytes.
+Loads the PSD template in Photopea, replaces the intended editable text
+layer, exports a PNG, and provides detailed diagnostics for Railway.
 
 Environment variables:
     PSD_TEMPLATE
     FONT_FILE
     TEXT_LAYER_MATCH
     RENDER_TIMEOUT_MS
+    PHOTOPEA_READY_TIMEOUT_MS
 """
 
 import asyncio
@@ -30,8 +31,12 @@ PSD_PATH = Path(
 FONT_PATH = Path(
     os.getenv("FONT_FILE", str(ROOT / "assets" / "Sequel100Black.ttf"))
 )
+
 LAYER_MATCH = os.getenv("TEXT_LAYER_MATCH", "BIGGESTCHAPOO")
 TIMEOUT_MS = int(os.getenv("RENDER_TIMEOUT_MS", "90000"))
+READY_TIMEOUT_MS = int(
+    os.getenv("PHOTOPEA_READY_TIMEOUT_MS", "90000")
+)
 
 PHOTOPEA_URL = "https://www.photopea.com/"
 
@@ -39,19 +44,21 @@ logger = logging.getLogger(__name__)
 
 
 async def render_text_png(text: str) -> bytes:
-    """Render replacement text using the supplied PSD template."""
+    """Render the requested text and return PNG bytes."""
 
     if not PSD_PATH.is_file():
-        raise FileNotFoundError(f"PSD template not found: {PSD_PATH}")
+        raise FileNotFoundError(
+            f"PSD template not found: {PSD_PATH}"
+        )
 
     if not text or not text.strip():
-        raise ValueError("Please provide some text to render.")
+        raise ValueError("Text cannot be empty.")
 
     logger.info("Starting Photopea render.")
     logger.info("PSD path: %s", PSD_PATH)
     logger.info("PSD size: %s bytes", PSD_PATH.stat().st_size)
-    logger.info("Configured text-layer marker: %s", LAYER_MATCH)
     logger.info("Font file exists: %s", FONT_PATH.is_file())
+    logger.info("Text-layer marker: %s", LAYER_MATCH)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -64,41 +71,66 @@ async def render_text_png(text: str) -> bytes:
         )
 
         page = await browser.new_page(
-            viewport={"width": 1400, "height": 1000},
-            accept_downloads=False,
+            viewport={"width": 1400, "height": 1000}
         )
 
-        # Keep diagnostics useful in Railway logs.
+        # Network diagnostics for Railway.
         page.on(
-            "console",
-            lambda msg: logger.info(
-                "Browser console [%s]: %s", msg.type, msg.text
-            ) if msg.type == "error" else None,
+            "response",
+            lambda response: logger.info(
+                "HTTP %s %s",
+                response.status,
+                response.url,
+            )
+            if "photopea.com" in response.url
+            else None,
         )
-        page.on(
-            "pageerror",
-            lambda exc: logger.error("Browser page error: %s", exc),
-        )
+
         page.on(
             "requestfailed",
-            lambda req: logger.warning(
-                "Browser request failed: %s (%s)",
-                req.url,
-                req.failure,
+            lambda request: logger.warning(
+                "Request failed: %s | %s",
+                request.url,
+                request.failure,
+            ),
+        )
+
+        page.on(
+            "pageerror",
+            lambda error: logger.error(
+                "Browser page error: %s", error
+            ),
+        )
+
+        page.on(
+            "console",
+            lambda msg: logger.warning(
+                "Browser console error: %s", msg.text
+            )
+            if msg.type == "error"
+            else None,
+        )
+
+        page.on(
+            "framenavigated",
+            lambda frame: logger.info(
+                "Frame navigated: %s", frame.url
             ),
         )
 
         try:
-            # Install the message listener BEFORE creating the iframe.
-            # Photopea's API uses "done" as its readiness response,
-            # app.echoToOE() for text diagnostics, and ArrayBuffer for exports.
+            # Register the outer-page listener BEFORE the iframe loads.
+            # Photopea communicates using postMessage:
+            # "done" = processing finished,
+            # ArrayBuffer = exported file,
+            # other strings = echoToOE messages.
             await page.set_content(
                 """
                 <!doctype html>
                 <html>
                 <head>
                     <meta charset="utf-8">
-                    <title>MODEX Photopea Worker</title>
+                    <title>MODEX Renderer</title>
                     <style>
                         html, body {
                             margin: 0;
@@ -107,7 +139,8 @@ async def render_text_png(text: str) -> bytes:
                             height: 100%;
                             overflow: hidden;
                         }
-                        iframe {
+                        #photopea {
+                            display: block;
                             width: 100%;
                             height: 100%;
                             border: 0;
@@ -119,12 +152,47 @@ async def render_text_png(text: str) -> bytes:
                         window.ppMessages = [];
 
                         window.addEventListener("message", function(event) {
-                            const data = event.data;
+                            const value = event.data;
 
-                            if (data instanceof ArrayBuffer) {
-                                const bytes = new Uint8Array(data);
+                            if (value instanceof ArrayBuffer) {
+                                const bytes = new Uint8Array(value);
                                 let binary = "";
-                                const chunkSize = 0x8000;
+                                const chunkSize = 8192;
+
+                                for (
+                                    let i = 0;
+                                    i < bytes.length;
+                                    i += chunkSize
+                                ) {
+                                    const part = bytes.subarray(
+                                        i,
+                                        Math.min(
+                                            i + chunkSize,
+                                            bytes.length
+                                        )
+                                    );
+
+                                    binary += String.fromCharCode(
+                                        ...part
+                                    );
+                                }
+
+                                window.ppMessages.push({
+                                    kind: "binary",
+                                    data: btoa(binary),
+                                    time: Date.now()
+                                });
+                            } else if (
+                                ArrayBuffer.isView(value)
+                            ) {
+                                const bytes = new Uint8Array(
+                                    value.buffer,
+                                    value.byteOffset,
+                                    value.byteLength
+                                );
+
+                                let binary = "";
+                                const chunkSize = 8192;
 
                                 for (
                                     let i = 0;
@@ -134,7 +202,10 @@ async def render_text_png(text: str) -> bytes:
                                     binary += String.fromCharCode(
                                         ...bytes.subarray(
                                             i,
-                                            Math.min(i + chunkSize, bytes.length)
+                                            Math.min(
+                                                i + chunkSize,
+                                                bytes.length
+                                            )
                                         )
                                     );
                                 }
@@ -142,19 +213,21 @@ async def render_text_png(text: str) -> bytes:
                                 window.ppMessages.push({
                                     kind: "binary",
                                     data: btoa(binary),
-                                    timestamp: Date.now()
+                                    time: Date.now()
                                 });
-                            } else if (typeof data === "string") {
+                            } else if (
+                                typeof value === "string"
+                            ) {
                                 window.ppMessages.push({
                                     kind: "text",
-                                    data: data,
-                                    timestamp: Date.now()
+                                    data: value,
+                                    time: Date.now()
                                 });
                             } else {
                                 window.ppMessages.push({
                                     kind: "other",
-                                    data: String(data),
-                                    timestamp: Date.now()
+                                    data: String(value),
+                                    time: Date.now()
                                 });
                             }
                         });
@@ -163,7 +236,6 @@ async def render_text_png(text: str) -> bytes:
                     <iframe
                         id="photopea"
                         src="https://www.photopea.com/"
-                        allow="clipboard-read; clipboard-write"
                     ></iframe>
                 </body>
                 </html>
@@ -171,29 +243,32 @@ async def render_text_png(text: str) -> bytes:
             )
 
             logger.info("Photopea iframe created.")
+            logger.info("Waiting for Photopea readiness.")
 
-            # Wait for Photopea's documented initialization message.
-            logger.info("Waiting for Photopea readiness message.")
-
-            await page.wait_for_function(
-                """
-                () => window.ppMessages.some(
-                    m => m.kind === "text" && m.data === "done"
+            # Do not continue until Photopea sends its documented "done".
+            try:
+                await page.wait_for_function(
+                    """
+                    () => window.ppMessages.some(
+                        message =>
+                            message.kind === "text" &&
+                            message.data === "done"
+                    )
+                    """,
+                    timeout=READY_TIMEOUT_MS,
                 )
-                """,
-                timeout=60000,
-            )
+            except PlaywrightTimeoutError as exc:
+                await _log_diagnostics(page)
+                raise RuntimeError(
+                    "Photopea did not send its initial readiness "
+                    "message. Check HTTP responses, failed requests, "
+                    "and frame URLs in the Railway logs."
+                ) from exc
 
             logger.info("Photopea ready.")
 
-            title = await page.title()
-            logger.info("Embedding page title: %s", title)
-
-            # Load the PSD into Photopea as an ArrayBuffer.
-            psd_b64 = base64.b64encode(
-                PSD_PATH.read_bytes()
-            ).decode("ascii")
-
+            # Send the PSD as binary data. Photopea should send "done"
+            # once the file has been processed.
             await page.evaluate(
                 """
                 (encoded) => {
@@ -204,67 +279,87 @@ async def render_text_png(text: str) -> bytes:
                         bytes[i] = raw.charCodeAt(i);
                     }
 
-                    const frame = document.getElementById("photopea");
-
-                    frame.contentWindow.postMessage(bytes.buffer, "*");
+                    document.getElementById("photopea")
+                        .contentWindow.postMessage(
+                            bytes.buffer,
+                            "*"
+                        );
                 }
                 """,
-                psd_b64,
+                base64.b64encode(
+                    PSD_PATH.read_bytes()
+                ).decode("ascii"),
             )
 
             logger.info("PSD sent to Photopea.")
 
-            # Give Photopea time to parse the PSD. The rendering script
-            # also checks that an active document and target layer exist.
-            await page.wait_for_timeout(5000)
+            try:
+                await page.wait_for_function(
+                    """
+                    () => window.ppMessages.some(
+                        message =>
+                            message.kind === "text" &&
+                            message.data === "done"
+                    )
+                    """,
+                    timeout=TIMEOUT_MS,
+                )
+            except PlaywrightTimeoutError as exc:
+                await _log_diagnostics(page)
+                raise RuntimeError(
+                    "Photopea did not confirm PSD processing."
+                ) from exc
 
-            # Remove old messages but keep the message listener active.
+            logger.info("Photopea finished processing the PSD.")
+
+            # Clear old messages, preserving the event listener.
             await page.evaluate("window.ppMessages = []")
 
+            # Match the marker by layer name OR original text contents.
+            # Do not silently edit an unrelated text layer.
             script = r"""
             try {
                 var wanted = __WANTED__;
                 var replacement = __REPLACEMENT__;
+                var doc = app.activeDocument;
 
-                if (!app.documents || app.documents.length === 0) {
-                    throw new Error(
-                        "No document is open. Photopea may not have loaded the PSD."
-                    );
+                if (!doc) {
+                    throw new Error("No active document.");
                 }
 
-                var doc = app.activeDocument;
-                var candidates = [];
+                var textLayers = [];
 
-                function collectTextLayers(layers) {
+                function collect(layers) {
                     for (var i = 0; i < layers.length; i++) {
                         var layer = layers[i];
 
                         try {
                             if (layer.layers) {
-                                collectTextLayers(layer.layers);
+                                collect(layer.layers);
                             }
                         } catch (e) {}
 
                         try {
                             if (layer.textItem) {
-                                candidates.push(layer);
+                                textLayers.push(layer);
                             }
                         } catch (e) {}
                     }
                 }
 
-                collectTextLayers(doc.layers);
+                collect(doc.layers);
 
-                if (candidates.length === 0) {
+                if (textLayers.length === 0) {
                     throw new Error(
                         "No editable text layers found in the PSD."
                     );
                 }
 
                 var target = null;
+                var layerNames = [];
 
-                for (var j = 0; j < candidates.length; j++) {
-                    var candidate = candidates[j];
+                for (var j = 0; j < textLayers.length; j++) {
+                    var candidate = textLayers[j];
                     var name = "";
                     var contents = "";
 
@@ -273,8 +368,13 @@ async def render_text_png(text: str) -> bytes:
                     } catch (e) {}
 
                     try {
-                        contents = candidate.textItem.contents || "";
+                        contents =
+                            candidate.textItem.contents || "";
                     } catch (e) {}
+
+                    layerNames.push(
+                        name + " [" + contents + "]"
+                    );
 
                     if (
                         name.toUpperCase().indexOf(
@@ -290,19 +390,10 @@ async def render_text_png(text: str) -> bytes:
                 }
 
                 if (!target) {
-                    var names = [];
-
-                    for (var k = 0; k < candidates.length; k++) {
-                        try {
-                            names.push(candidates[k].name);
-                        } catch (e) {
-                            names.push("(unnamed layer)");
-                        }
-                    }
-
                     throw new Error(
-                        "Target layer not found: " + wanted +
-                        ". Editable text layers: " + names.join(", ")
+                        "Could not find text layer matching '" +
+                        wanted + "'. Found: " +
+                        layerNames.join("; ")
                     );
                 }
 
@@ -310,11 +401,13 @@ async def render_text_png(text: str) -> bytes:
 
                 app.echoToOE("MODEX_TEXT_UPDATED");
 
-                // Export through Photopea's embedding interface.
+                // Photopea returns exported PNG bytes as an ArrayBuffer.
                 doc.saveToOE("png");
 
             } catch (error) {
-                app.echoToOE("MODEX_RENDER_ERROR:" + error.message);
+                app.echoToOE(
+                    "MODEX_RENDER_ERROR:" + error.message
+                );
             }
             """
 
@@ -324,67 +417,85 @@ async def render_text_png(text: str) -> bytes:
                 "__REPLACEMENT__", json.dumps(text)
             )
 
+            logger.info("Sending text replacement script.")
+
             await page.evaluate(
                 """
                 (scriptText) => {
                     document.getElementById("photopea")
-                        .contentWindow.postMessage(scriptText, "*");
+                        .contentWindow.postMessage(
+                            scriptText,
+                            "*"
+                        );
                 }
                 """,
                 script,
             )
 
-            logger.info("Rendering script sent to Photopea.")
-
-            # Wait for an export or an explicit script error.
-            await page.wait_for_function(
-                """
-                () => window.ppMessages.some(m =>
-                    m.kind === "binary" ||
-                    (
-                        m.kind === "text" &&
-                        m.data.startsWith("MODEX_RENDER_ERROR:")
+            # Wait until Photopea returns PNG bytes or an explicit error.
+            try:
+                await page.wait_for_function(
+                    """
+                    () => window.ppMessages.some(message =>
+                        message.kind === "binary" ||
+                        (
+                            message.kind === "text" &&
+                            message.data.startsWith(
+                                "MODEX_RENDER_ERROR:"
+                            )
+                        )
                     )
+                    """,
+                    timeout=TIMEOUT_MS,
                 )
-                """,
-                timeout=TIMEOUT_MS,
-            )
+            except PlaywrightTimeoutError as exc:
+                await _log_diagnostics(page)
+                raise RuntimeError(
+                    "Photopea timed out while updating the text "
+                    "or exporting the PNG."
+                ) from exc
 
-            messages = await page.evaluate("window.ppMessages")
+            messages = await page.evaluate(
+                "() => window.ppMessages"
+            )
 
             for message in messages:
                 if message["kind"] == "text":
                     logger.info(
-                        "Photopea message: %s", message["data"]
+                        "Photopea message: %s",
+                        message["data"],
                     )
 
             errors = [
-                m["data"]
-                for m in messages
-                if m["kind"] == "text"
-                and m["data"].startswith("MODEX_RENDER_ERROR:")
+                message["data"]
+                for message in messages
+                if (
+                    message["kind"] == "text"
+                    and message["data"].startswith(
+                        "MODEX_RENDER_ERROR:"
+                    )
+                )
             ]
 
             if errors:
                 raise RuntimeError(errors[-1])
 
             exports = [
-                m["data"]
-                for m in messages
-                if m["kind"] == "binary"
+                message["data"]
+                for message in messages
+                if message["kind"] == "binary"
             ]
 
             if not exports:
                 raise RuntimeError(
-                    "Photopea did not return PNG binary data."
+                    "Photopea returned no binary PNG data."
                 )
 
             png = base64.b64decode(exports[-1])
 
-            # Validate PNG signature and dimensions.
             if not png.startswith(b"\x89PNG\r\n\x1a\n"):
                 raise RuntimeError(
-                    "Export response was not a valid PNG."
+                    "The exported data is not a valid PNG."
                 )
 
             if len(png) < 24:
@@ -393,10 +504,12 @@ async def render_text_png(text: str) -> bytes:
             width, height = struct.unpack(">II", png[16:24])
 
             if width <= 0 or height <= 0:
-                raise RuntimeError("PNG dimensions are invalid.")
+                raise RuntimeError(
+                    "PNG export has invalid dimensions."
+                )
 
             logger.info(
-                "PNG exported successfully: %sx%s, %s bytes",
+                "PNG exported successfully: %sx%s, %s bytes.",
                 width,
                 height,
                 len(png),
@@ -404,46 +517,53 @@ async def render_text_png(text: str) -> bytes:
 
             return png
 
-        except PlaywrightTimeoutError as exc:
-            try:
-                messages = await page.evaluate(
-                    "() => window.ppMessages || []"
-                )
-            except Exception:
-                messages = []
-
-            logger.error(
-                "Photopea timeout. Recent messages: %s",
-                messages[-15:],
-            )
-
-            try:
-                iframe_info = await page.locator(
-                    "#photopea"
-                ).evaluate(
-                    """
-                    frame => ({
-                        src: frame.src,
-                        connected: frame.isConnected,
-                        hasContentWindow: !!frame.contentWindow
-                    })
-                    """
-                )
-                logger.error("Photopea iframe info: %s", iframe_info)
-            except Exception as diagnostic_error:
-                logger.error(
-                    "Could not inspect iframe: %s",
-                    diagnostic_error,
-                )
-
-            raise RuntimeError(
-                "Photopea timed out waiting for readiness or export. "
-                "See the preceding Railway logs for browser diagnostics."
-            ) from exc
-
-        except Exception:
-            logger.exception("Photopea render failed.")
-            raise
-
         finally:
             await browser.close()
+
+
+async def _log_diagnostics(page):
+    """Write browser and iframe information to the Railway logs."""
+
+    try:
+        messages = await page.evaluate(
+            "() => window.ppMessages || []"
+        )
+        logger.error(
+            "Photopea messages received: %s",
+            messages[-20:],
+        )
+    except Exception as exc:
+        logger.error("Could not inspect messages: %s", exc)
+
+    try:
+        frames = []
+
+        for frame in page.frames:
+            details = {"url": frame.url}
+
+            try:
+                details["title"] = await frame.title()
+            except Exception as exc:
+                details["title_error"] = str(exc)
+
+            frames.append(details)
+
+        logger.error("Browser frames: %s", frames)
+    except Exception as exc:
+        logger.error("Could not inspect browser frames: %s", exc)
+
+    try:
+        iframe_info = await page.locator(
+            "#photopea"
+        ).evaluate(
+            """
+            frame => ({
+                src: frame.src,
+                connected: frame.isConnected,
+                hasContentWindow: !!frame.contentWindow
+            })
+            """
+        )
+        logger.error("Photopea iframe info: %s", iframe_info)
+    except Exception as exc:
+        logger.error("Could not inspect Photopea iframe: %s", exc)
